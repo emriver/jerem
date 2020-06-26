@@ -3,6 +3,8 @@ package runner
 import (
 	"bytes"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	warp "github.com/PierreZ/Warp10Exporter"
@@ -35,14 +37,17 @@ func SprintRunner(config core.Config) {
 			return
 		}
 
+		log.Debug(config.Jira.ClosedStatuses)
+		closed := fmt.Sprintf("(%s)", strings.Join(config.Jira.ClosedStatuses, ","))
+
 		for _, sprint := range sprints.Values {
-			processSprint(jiraClient, sprint, project, batch)
+			processSprint(jiraClient, sprint, project, batch, closed)
 		}
 
 		// Get last day closed impediment and set issue timespent at its creation date
 		var closedImpediments []jira.Issue
 
-		err = jiraClient.Issue.SearchPages(fmt.Sprintf("(project = \"%s\" %s) AND status in (Resolved, Closed, Done) AND labels in (Impediment, impediment) AND updated >= -1d AND timespent is not EMPTY", project.Name, project.Jql), &jira.SearchOptions{
+		err = jiraClient.Issue.SearchPages(fmt.Sprintf("(project = \"%s\" %s) AND status in %s AND labels in (Impediment, impediment) AND updated >= -1d AND timespent is not EMPTY", project.Name, project.Jql, closed), &jira.SearchOptions{
 			Fields: []string{"id", "key", "project", "created", "timespent"},
 		}, func(issue jira.Issue) error {
 			closedImpediments = append(closedImpediments, issue)
@@ -69,10 +74,11 @@ func SprintRunner(config core.Config) {
 	var b bytes.Buffer
 	batch.Print(&b)
 	log.Debug(b.String())
-
-	err = batch.Push(config.Metrics.URL, config.Metrics.Token)
-	if err != nil {
-		log.WithError(err).Error("Fail to push metrics")
+	if len(*batch) != 0 {
+		err = batch.Push(config.Metrics.URL, config.Metrics.Token)
+		if err != nil {
+			log.WithError(err).Error("Fail to push metrics")
+		}
 	}
 }
 
@@ -113,13 +119,38 @@ func getImpedimentSprintMetric(name, projectLabel, sprint string) *warp.GTS {
 	})
 }
 
-func processSprint(jiraClient *jira.Client, sprint jira.Sprint, project core.Project, batch *warp.Batch) {
-	issues, _, err := jiraClient.Sprint.GetIssuesForSprint(sprint.ID)
+//GetIssuesForSprint overrides go-jira GetIssuesForSprint to apply jql filter on issues
+func GetIssuesForSprint(jiraClient *jira.Client, sprintID int, jql string) ([]jira.Issue, *jira.Response, error) {
+
+	if jql != "" {
+		apiEndpoint := fmt.Sprintf("rest/agile/1.0/sprint/%d/issue?jql=%s", sprintID, url.QueryEscape(jql))
+		req, err := jiraClient.NewRequest("GET", apiEndpoint, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		result := new(jira.IssuesInSprintResult)
+		resp, err := jiraClient.Do(req, result)
+		if err != nil {
+			err = jira.NewJiraError(resp, err)
+		}
+		log.WithFields(log.Fields{"project": jql, "count": len(result.Issues)}).Debug("Sprint issue")
+		return result.Issues, resp, err
+	}
+	return jiraClient.Sprint.GetIssuesForSprint(sprintID)
+}
+
+func processSprint(jiraClient *jira.Client, sprint jira.Sprint, project core.Project, batch *warp.Batch, jiraCloseStatus string) {
+	jql := ""
+	if project.Jql != "" {
+		jql = fmt.Sprintf("project=%s %s", project.Name, project.Jql)
+	}
+	issues, _, err := GetIssuesForSprint(jiraClient, sprint.ID, jql)
 	if err != nil {
 		log.WithFields(log.Fields{"sprint": sprint.Name, "project": project.Label}).
 			WithError(err).Warn("Fail to get issue for sprint")
 		return
 	}
+	//TODO filter issues
 	storyPoints, _, _ := computeStoryPoints(issues, storyPointField)
 
 	// Gen metrics
@@ -145,7 +176,7 @@ func processSprint(jiraClient *jira.Client, sprint jira.Sprint, project core.Pro
 
 	// Get current sprint closed impediments
 	var impediments []jira.Issue
-	err = jiraClient.Issue.SearchPages(fmt.Sprintf("(project = \"%s\" %s) AND status in (Resolved, Closed, Done) AND labels in (Impediment, impediment) AND updated >= %s AND updated <= %s AND timespent is not EMPTY", project.Name, project.Jql, sprint.StartDate.Format("2006-01-02"), sprint.EndDate.Format("2006-01-02")), &jira.SearchOptions{
+	err = jiraClient.Issue.SearchPages(fmt.Sprintf("(project = \"%s\" %s) AND status in %s AND labels in (Impediment, impediment) AND updated >= %s AND updated <= %s AND timespent is not EMPTY", project.Name, project.Jql, jiraCloseStatus, sprint.StartDate.Format("2006-01-02"), sprint.EndDate.Format("2006-01-02")), &jira.SearchOptions{
 		Fields: []string{"id", "key", "project", "labels", "summary", "status", "timespent", impedimentField},
 	}, func(issue jira.Issue) error {
 		impediments = append(impediments, issue)
